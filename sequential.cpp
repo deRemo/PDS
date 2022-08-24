@@ -68,13 +68,20 @@ int main(int argc, char* argv[]){
 	}
 	
 	//user-defined param
-	int n_particles = atoi(argv[1]);
+	int n_particles = atoi(argv[1]);	
 	
 	auto f = [](float x, float y){return (x*x) + (y*y) + 1;};
+	
+	int Tc = 0;
+	float result = 0;
 	{
-		utimer u("Sequential");
-		std::cout << "global opt: " << PSO(n_particles, f, A, B, C, MAX_IT, LB, UB) << std::endl;
+		silent_utimer u;
+		result = PSO(n_particles, f, A, B, C, MAX_IT, LB, UB);
+		Tc = u.get_current_micros();
 	}
-
+	
+	std::cout << "completion time: " << Tc / 1000 << std::endl;
+	std::cout << "global opt: " << result << std::endl;
+	
 	return 0;
 }

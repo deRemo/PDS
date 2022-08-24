@@ -5,6 +5,7 @@
 #include<atomic>
 #include<random>
 #include<functional>
+#include <cmath> 
 #include"pso_utils.hpp"
 #include"sample_queue.hpp"
 #include"utimer.hpp"
@@ -46,11 +47,11 @@ struct SyncMessage{
     float x;
     float y;
 
-    bool init_phase;
+    bool terminate;
 
     SyncMessage(){
         opt = std::numeric_limits<float>::max();
-        init_phase = true;
+        terminate = false;
     }
 };
 
@@ -87,20 +88,13 @@ struct PSOMaster{
 
     void run(){
         auto body = [&](){
-			//Create and send sync messages
-            for(int i=0; i<n_msg; i++){
-                SyncMessage* msg = new SyncMessage();
-                send_to(msg, i);
-            }
-			
-            while(it < max_it + 1){
-                //collect messages
+            while(it < max_it + 1){ //+1 because the iterative step is also included
+				//collect messages
 				while(msg_count < n_msg){
-					int i = get_id();
-                    auto msg = get_from(i); //busy wait for messages
-                    msg_count++;
-
-                    //re-evaluate global opt
+                    auto msg = in_queues.at(cnt++ % in_queues.size())->pop();
+					msg_count++;
+                   	 
+					//re-evaluate global opt
                     if(msg->opt < global_opt){
                         global_opt = msg->opt;
                         g_x = msg->x;
@@ -108,22 +102,21 @@ struct PSOMaster{
                     }
 					waiting_queue.push(msg);
                 }
-
+				
                 //sync best values between workers and start new iteration
                 msg_count = 0;
                 sync_and_send();
-
-                it++;
+                
+				it++;
             }
 			
 			//cleanup messages and terminate workers
             while(msg_count < n_msg){
-                int i = get_id();
+                auto msg = in_queues.at(cnt % in_queues.size())->pop();
 
-                auto msg = get_from(i);
-                msg_count++;
-                send_to(EOS, i);
-                delete msg;
+				msg_count++;
+				msg->terminate = true;
+                send_to(msg, cnt++ % in_queues.size());
             }
         };
 
@@ -151,21 +144,7 @@ struct PSOMaster{
     void send_to(SyncMessage* msg, int i){
         out_queues.at(i)->push(msg);
     }
-
-    //Returns the id of a worker that finished the iteration in a round robin fashion
-    int get_id(){
-        while(in_queues.at(cnt % in_queues.size())->is_empty()){
-            cnt++;
-        }
-
-        return cnt % in_queues.size();
-    }
-
-    //Get message from worker i
-    SyncMessage* get_from(int i){
-        return in_queues.at(i)->pop();
-    }
-
+	
     //Wait for the thread to finish
     void wait(){
         tid.join();
@@ -208,6 +187,9 @@ struct PSOWorker{
     sample_queue<SyncMessage*>* in_q;
     sample_queue<SyncMessage*>* out_q;
 	
+	//performance
+	std::vector<int> Ts;
+	
 	PSOWorker(int _n_particles, std::function<float(float,float)> _f, float _a, float _b, float _c, float _lower_bound, float _upper_bound):generator(std::random_device{}()){
         n_particles = _n_particles;
         particles.reserve(_n_particles);
@@ -237,24 +219,26 @@ struct PSOWorker{
                     group_y = p.l_y;
                 }
             }
+			
+			//Create and send sync message
+			SyncMessage* init_msg = new SyncMessage();
+			
+			init_msg->opt = group_opt;
+			init_msg->x = group_x;
+			init_msg->y = group_y;
+			out_q->push(init_msg);
 
-            //wait for the sync message
+            //wait for the response and start iterative step
             auto msg = in_q->pop();
-            while(msg != EOS){
-				//First phase: synchronize the initial knowledge
-                if(msg->init_phase == true){
-                    msg->opt = group_opt;
-                    msg->x = group_x;
-                    msg->y = group_y;
+            while(msg->terminate != true){
+				{
+					silent_utimer u;
 
-                    msg->init_phase = false;
-                }
-                else{
                     //iteration best values
                     float it_opt = msg->opt;
                     float it_x = msg->x;
                     float it_y = msg->y;
-                    
+                        
                     for(Particle& p : particles){
                         //update velocity and position
                         p.update_velocity(a, b, c, msg->x, msg->y);
@@ -269,19 +253,23 @@ struct PSOWorker{
                             }
                         }
                     }
-                
+                    
                     //assign best it values to the group values
                     msg->opt = it_opt;
                     msg->x = it_x;
                     msg->y = it_y;
-                }
+                    
+                    Ts.push_back(u.get_current_micros());
+				}
 
-                //send to emitter
+				//send to emitter
                 out_q->push(msg);
-                
+				
 				//wait for next iteration
                 msg = in_q->pop();
             }
+			
+			delete msg;
         };
 
         tid = std::thread(body);
@@ -346,7 +334,7 @@ struct PSOParallel{
         master->run();
         core_picker->stick(&(master->tid));
 
-        for(int i=0; i<workers.size(); i++){
+		for(int i=0; i<workers.size(); i++){
             workers[i]->run();
             core_picker->stick(&(workers[i]->tid));
         }
@@ -372,25 +360,40 @@ struct PSOParallel{
 
 int main(int argc, char* argv[]){
     if(argc < 3){
-		std::cout << "usage: ./prog particles_per_task nw" << std::endl;		
+		std::cout << "usage: ./prog n_particles nw" << std::endl;		
 		return -1;
 	}
     
     //user-defined params
-    int particles_per_task = atoi(argv[1]);
+    int n_particles = atoi(argv[1]);
     int nw = atoi(argv[2]);
+    int particles_per_group = ceil(float(n_particles)/float(nw));
+    
+	auto f = [](float x, float y){return (x*x) + (y*y) + 1;};
+	
+	//Init core picker
+	CorePicker core_picker;
+	int Tc = 0;
+	{
+    	silent_utimer u;
+		PSOParallel par(particles_per_group, nw, f, A, B, C, MAX_IT, LB, UB);
+    	par.set_picker(&core_picker);
 
-    auto f = [](float x, float y){return (x*x) + (y*y) + 1;};
-
-    //Init core picker
-    CorePicker core_picker;
-    PSOParallel par(particles_per_task, nw, f, A, B, C, MAX_IT, LB, UB);
-    par.set_picker(&core_picker);
-    {
-        utimer u("Native parallel");
         par.run_and_wait_end();
+		Tc = u.get_current_micros();
+	
+		std::cout << "completion time: " << Tc / 1000 << std::endl;
+
+    	int Texec_w = 0;
+		for(int i=0; i<par.workers.size(); i++){
+			Texec_w += vector_sum(par.workers[i]->Ts);
+		}
+		Texec_w = Texec_w / nw;
+
+		std::cout << "Avg. worker exec. time: " << Texec_w / 1000 << std::endl;
+		std::cout << "Master exec. time " << (Tc - Texec_w) / 1000<< std::endl;
+    	std::cout << "global opt: " << par.master->global_opt << std::endl;
     }
 
-    std::cout << "global opt: " << par.master->global_opt << std::endl;
     return 0;
 }

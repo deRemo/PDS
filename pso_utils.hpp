@@ -91,3 +91,33 @@ struct Particle{
 		return std::uniform_real_distribution<float>{lower_bound, upper_bound}(*generator);
 	}
 };
+
+//Performance tools
+
+//sum of the vector elements
+int vector_sum(std::vector<int> v){
+	int res=0;
+	
+	for(int i=0; i<v.size(); i++){
+		res += v[i];
+	}
+
+	return res;
+}
+
+//average of the vector elements
+float vector_avg(std::vector<int> v){
+    float res= (float) vector_sum(v);
+    int n=v.size();
+
+    return res/n;
+}
+
+//print a vector in a readable way
+void print_vector(std::vector<int> v){
+    for(int i=0; i<v.size(); i++){
+        std::cout << v[i] << " ";
+	}
+
+    std::cout << std::endl;
+}

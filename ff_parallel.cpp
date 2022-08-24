@@ -1,6 +1,7 @@
 #include<iostream>
 #include<vector>
 #include<functional>
+#include<cmath>
 #include<ff/ff.hpp>
 
 #include"pso_utils.hpp"
@@ -12,11 +13,8 @@ struct SyncMessage{
     float x;
     float y;
 
-    bool init_phase;
-
     SyncMessage(){
         opt = std::numeric_limits<float>::max();
-        init_phase = true;
     }
 };
 
@@ -47,16 +45,11 @@ struct PSOMaster: ff::ff_node {
     }
 
     void* svc(void* task){
-        //Create and send sync messages
         if(task == nullptr){
-            for(int i=0; i<n_msg; i++){
-                lb->ff_send_out_to(new SyncMessage(), i);
-            }
-
-            return GO_ON;
+			return GO_ON;
         }
-		
-        msg_count++;
+				
+		msg_count++;
         SyncMessage* msg = (SyncMessage*) task;
         waiting_queue.push(msg);
 
@@ -82,8 +75,8 @@ struct PSOMaster: ff::ff_node {
                 return EOS;
             }
             else{ //sync best values between workers and start new iteration
-                msg_count = 0;
-                
+				msg_count = 0;
+				
                 int i = 0;
                 while(!waiting_queue.empty()){
                     SyncMessage* msg = waiting_queue.front();
@@ -96,7 +89,7 @@ struct PSOMaster: ff::ff_node {
                     lb->ff_send_out_to(msg, i);
                     i++;
                 }
-            }
+			}
         }
 		
         return GO_ON;
@@ -122,6 +115,9 @@ struct PSOWorker: ff::ff_node{
     
     //thread random number generator
     std::default_random_engine generator;
+	
+	//performance
+	std::vector<int> Ts;
 
     PSOWorker(int _n_particles, std::function<float(float,float)> _f, float _a, float _b, float _c, float _lower_bound, float _upper_bound):generator(std::random_device{}()){
         n_particles = _n_particles;
@@ -151,90 +147,105 @@ struct PSOWorker: ff::ff_node{
                 group_y = p.l_y;
 		    }
 		}
+	
+		//create the sync message	
+		SyncMessage* msg = new SyncMessage();
+		
+		msg->opt = group_opt;
+        msg->x = group_x;
+        msg->y = group_y;
 
+		ff_send_out(msg);
         return 0;
     }
-
+	
     void* svc(void* task){
-        SyncMessage* msg = (SyncMessage*) task;
-        
-        //Send the initial group knowledge
-        if(msg->init_phase == true){
-            msg->opt = group_opt;
-            msg->x = group_x;
-            msg->y = group_y;
-            msg->init_phase = false;
+       	SyncMessage* msg = (SyncMessage*) task; 
+		{
+            silent_utimer u;
+            
+            //Iterative step
+            //iteration best values
+            float it_opt = msg->opt;
+            float it_x = msg->x;
+            float it_y = msg->y;
 
-            return msg;
-        }
-		
-        //Iterative step
+            for(Particle& p : particles){
+                //update velocity and position
+                p.update_velocity(a, b, c, msg->x, msg->y);
+                p.update_position();
 
-        //iteration best values
-        float it_opt = msg->opt;
-        float it_x = msg->x;
-        float it_y = msg->y;
-
-        for(Particle& p : particles){
-            //update velocity and position
-            p.update_velocity(a, b, c, msg->x, msg->y);
-            p.update_position();
-
-            //evaluate local_opt and global_opt
-            if(p.evaluate_local_opt(f)){
-                if(p.local_opt < msg->opt){
-                    it_opt = p.local_opt;
-                    it_x = p.l_x;
-                    it_y = p.l_y;
+                //evaluate local_opt and global_opt
+                if(p.evaluate_local_opt(f)){
+                    if(p.local_opt < msg->opt){
+                        it_opt = p.local_opt;
+                        it_x = p.l_x;
+                        it_y = p.l_y;
+                    }
                 }
             }
-        }
-    
-        //assign best iteration values to the message
-        msg->opt = it_opt;
-        msg->x = it_x;
-        msg->y = it_y;
+        
+            //assign best iteration values to the message
+            msg->opt = it_opt;
+            msg->x = it_x;
+            msg->y = it_y;
 
-        return (void*) msg;
+            Ts.push_back(u.get_current_micros());
+		}
+		return (void*) msg;
     }
 };
 
 int main(int argc, char* argv[]){
     if(argc < 3){
-		std::cout << "usage: ./prog particles_per_task nw" << std::endl;		
+		std::cout << "usage: ./prog n_particles nw" << std::endl;		
 		return -1;
 	}
     
     //user-defined params
-    int particles_per_task = atoi(argv[1]);
+    int n_particles = atoi(argv[1]);
     int nw = atoi(argv[2]);
+    int particles_per_group = ceil(float(n_particles)/float(nw));
     
     auto f = [](float x, float y){return (x*x) + (y*y) + 1;};
+	
+	int Tc = 0;
+	{
+    	silent_utimer u;
 
-    //Create farm and nodes
-    ff::ff_farm par;
-    PSOMaster master(nw, MAX_IT, par.getlb());
-    std::vector<ff::ff_node*> PSOWorkers;
-    for(int i=0; i<nw; i++){
-        PSOWorkers.push_back(new PSOWorker(particles_per_task, f, A, B, C, LB, UB));
-    }
+		//Create farm and nodes
+    	ff::ff_farm par;
+    	PSOMaster master(nw, MAX_IT, par.getlb());
+    	std::vector<ff::ff_node*> workers;
+    	for(int i=0; i<nw; i++){
+        	workers.push_back(new PSOWorker(particles_per_group, f, A, B, C, LB, UB));
+    	}
+	
+    	//Setup farm
+    	par.add_workers(workers);
+   	 	par.cleanup_workers(true);
+    	par.add_emitter(&master);
+    	par.remove_collector();
 
-    //Setup farm
-    par.add_workers(PSOWorkers);
-    par.cleanup_workers(true);
-    par.add_emitter(&master);
-    par.remove_collector();
+    	par.wrap_around();
 
-    par.wrap_around();
-    par.set_scheduling_ondemand();
-
-    //run farm
-    {
-        utimer u("FF parallel");
+    	//run farm
         par.run_and_wait_end();
-    }
+		Tc = u.get_current_micros();
 
-    std::cout << "global opt: " << master.global_opt << std::endl;
+    	//performance
+		std::cout << "completion time: " << Tc / 1000 << std::endl;
 
+    	int Texec_w = 0;
+    	for(int i=0; i<workers.size(); i++){
+        	PSOWorker* w = (PSOWorker*) workers[i];
+			Texec_w += vector_sum(w->Ts);
+    	}
+    	Texec_w = Texec_w / nw;
+	
+		std::cout << "Avg. worker exec. time: " << Texec_w / 1000 << std::endl;
+		std::cout << "Master exec. time " << (Tc - Texec_w) / 1000<< std::endl;
+    	std::cout << "global opt: " << master.global_opt << std::endl;
+	}
     return 0;
 }

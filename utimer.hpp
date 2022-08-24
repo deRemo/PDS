@@ -16,10 +16,6 @@ class utimer {
   	utimer(const std::string m) : message(m) {
     	start = std::chrono::system_clock::now();
   	}
-	
-	utimer(){
-    	start = std::chrono::system_clock::now();
-  	}
 
   	~utimer() {
     	stop = std::chrono::system_clock::now();
